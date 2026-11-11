@@ -27,11 +27,9 @@ The first installation is a free-standing construction rather than an integrated
 
 ## Mechanical fasteners
 
-Current planned fasteners:
+Verified fasteners used for the current build:
 
 | Component | Fastener |
 |---|---|
-| Display | M2.5 machine screw, no nut |
-| Power connector | M1.6 machine screw + M1.6 nut |
-
-Exact screw length depends on the printed enclosure and connector flange thickness.
+| Display | Black M2.5 × 10 mm machine screw, no nut |
+| Power connector | Black M1.6 × 10 mm machine screw + M1.6 nut |

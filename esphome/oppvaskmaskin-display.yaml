@@ -1,0 +1,2069 @@
+esphome:
+  name: oppvaskmaskin-display
+  friendly_name: Oppvaskmaskin display
+
+  on_boot:
+    priority: -100
+    then:
+      # Start mørkt. Reell maskinaktivitet eller touch kan vekke displayet.
+      - delay: 750ms
+
+      - lvgl.pause:
+          show_snow: true
+
+      - switch.turn_off: display_backlight
+
+      - lambda: |-
+          id(ha_offline_active_since) = 0;
+
+      - script.execute: refresh_ui
+      - script.execute: refresh_connection
+      - script.execute: apply_display_policy
+
+
+# =========================================================
+# ESP32-S3 / NETTVERK
+# =========================================================
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+
+logger:
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+
+# =========================================================
+# WAVESHARE ESP32-S3-TOUCH-LCD-5B
+# SKU 28151
+# =========================================================
+
+i2c:
+  - id: bus_a
+    sda: GPIO8
+    scl: GPIO9
+    scan: false
+
+ch422g:
+  - id: ch422g_hub
+    i2c_id: bus_a
+
+display:
+  - platform: mipi_rgb
+    model: WAVESHARE-5-1024X600
+    id: lcd
+    auto_clear_enabled: false
+    update_interval: never
+
+
+# =========================================================
+# BAKLYS
+# CH422G EXIO2
+# =========================================================
+
+switch:
+  - platform: gpio
+    id: display_backlight
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+    pin:
+      ch422g: ch422g_hub
+      number: 2
+      mode:
+        output: true
+      inverted: false
+
+
+# =========================================================
+# TOUCH
+#
+# Hele glassflaten brukes bare til manuell skjerm ON/OFF.
+# GT911:
+#   GPIO4 = interrupt
+#   CH422G EXIO1 = reset
+# =========================================================
+
+touchscreen:
+  - platform: gt911
+    id: display_touch
+    display: lcd
+    i2c_id: bus_a
+
+    interrupt_pin: GPIO4
+
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 1
+      mode:
+        output: true
+      inverted: false
+
+    on_release:
+      then:
+
+        # 1 sekund sperre mot dobbelttrykk/bounce
+        - if:
+            condition:
+              lambda: |-
+                const uint32_t now = millis();
+
+                return
+                  id(last_touch_toggle) == 0 ||
+                  (uint32_t)(now - id(last_touch_toggle)) >= 1000;
+
+            then:
+
+              - lambda: |-
+                  id(last_touch_toggle) = millis();
+
+              - if:
+                  condition:
+                    switch.is_on: display_backlight
+
+                  # ---------------------------------------
+                  # MANUELL AV
+                  # ---------------------------------------
+                  then:
+
+                    - lambda: |-
+                        id(manual_display_off) = true;
+                        id(manual_wake_until) = 0;
+
+                    - script.execute: screen_off
+
+
+                  # ---------------------------------------
+                  # MANUELL PÅ
+                  # ---------------------------------------
+                  else:
+
+                    - lambda: |-
+                        id(manual_display_off) = false;
+                        id(reconnect_hold_off) = false;
+
+                        // Minst 60 sekunder på ved manuell vekking
+                        // hvis automatisk policy ellers ville slått av.
+                        id(manual_wake_until) =
+                          millis() + 60UL * 1000UL;
+
+                        if (!id(ha_was_connected)) {
+                          id(ha_offline_active_since) = 0;
+                        }
+
+                    - script.execute: screen_on
+
+
+# =========================================================
+# INTERNE TILSTANDER
+# =========================================================
+
+globals:
+
+  - id: manual_display_off
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: manual_wake_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_touch_toggle
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_miele_status
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: status_event_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # FERDIG vises i 15 minutter
+  - id: finished_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # AV/KLAR vises i 30 sekunder etter faktisk statusendring
+  - id: idle_show_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Feil/advarsel kan holde en allerede tent skjerm på
+  # i inntil 15 minutter, men vekker aldri skjermen.
+  - id: attention_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # HA-forbindelse
+  - id: ha_was_connected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ha_ever_connected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: ha_offline_active_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # HA-reconnect skal ikke vekke skjermen hvis den var av
+  - id: reconnect_hold_off
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: want_screen_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+# =========================================================
+# FONTER
+# =========================================================
+
+font:
+
+  # Stor resttid
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 700
+    id: time_font
+    size: 190
+    bpp: 4
+    glyphsets: []
+    glyphs:
+      - "0123456789:-"
+
+  # AV / KLAR / FERDIG / FEIL
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 700
+    id: state_font
+    size: 130
+    bpp: 4
+    glyphsets: []
+    glyphs:
+      - "AVKLRFEDIG-"
+
+  # Valgt program
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 700
+    id: title_font
+    size: 44
+    bpp: 4
+    glyphsets:
+      - GF_Latin_Kernel
+      - GF_Latin_Core
+
+  # Programfase / overskrifter
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 600
+    id: body_font
+    size: 28
+    bpp: 4
+    glyphsets:
+      - GF_Latin_Kernel
+      - GF_Latin_Core
+
+  # Nivåtekster
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 500
+    id: small_font
+    size: 22
+    bpp: 4
+    glyphsets:
+      - GF_Latin_Kernel
+      - GF_Latin_Core
+
+  # HA-status / sekundærtekst
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 500
+    id: tiny_font
+    size: 18
+    bpp: 4
+    glyphsets:
+      - GF_Latin_Kernel
+      - GF_Latin_Core
+
+
+# =========================================================
+# HOME ASSISTANT - STATUS / PROGRAM / FASE
+# =========================================================
+
+text_sensor:
+
+  - platform: homeassistant
+    id: miele_status
+    entity_id: sensor.oppvaskmaskin
+
+    on_value:
+      then:
+
+        - lambda: |-
+            const uint32_t now = millis();
+            const std::string s = id(miele_status).state;
+
+            id(status_event_pending) = false;
+
+            // Første verdi etter ESPHome-boot:
+            // etabler baseline uten å tolke dette som ny hendelse.
+            if (id(last_miele_status).empty()) {
+
+              id(last_miele_status) = s;
+              id(status_event_pending) = true;
+
+              // Hvis ESPHome faktisk starter mens maskinen kjører,
+              // kan skjermen vises.
+              if (
+                s == "in_use" ||
+                s == "pause" ||
+                s == "programmed" ||
+                s == "waiting_to_start"
+              ) {
+                id(manual_display_off) = false;
+                id(reconnect_hold_off) = false;
+              }
+
+              return;
+            }
+
+            // Samme status igjen, f.eks. etter HA-restart:
+            // ingen ny maskinhendelse.
+            if (s == id(last_miele_status)) {
+              return;
+            }
+
+            id(last_miele_status) = s;
+            id(status_event_pending) = true;
+
+            // -------------------------------------------
+            // AKTIV / VENTENDE KJØRING
+            // -------------------------------------------
+
+            if (
+              s == "in_use" ||
+              s == "pause" ||
+              s == "programmed" ||
+              s == "waiting_to_start"
+            ) {
+
+              id(finished_until) = 0;
+              id(idle_show_until) = 0;
+              id(attention_until) = 0;
+
+              // Reell maskinhendelse opphever manuell av.
+              id(manual_display_off) = false;
+              id(reconnect_hold_off) = false;
+              id(manual_wake_until) = 0;
+            }
+
+            // -------------------------------------------
+            // PROGRAM FERDIG
+            // -------------------------------------------
+
+            else if (s == "program_ended") {
+
+              id(finished_until) =
+                now + 15UL * 60UL * 1000UL;
+
+              id(idle_show_until) = 0;
+              id(attention_until) = 0;
+
+              id(manual_display_off) = false;
+              id(reconnect_hold_off) = false;
+              id(manual_wake_until) = 0;
+            }
+
+            // -------------------------------------------
+            // AV / KLAR
+            // -------------------------------------------
+
+            else if (
+              s == "off" ||
+              s == "idle" ||
+              s == "on"
+            ) {
+
+              id(idle_show_until) =
+                now + 30UL * 1000UL;
+
+              id(attention_until) = 0;
+
+              if (!id(manual_display_off)) {
+                id(reconnect_hold_off) = false;
+              }
+            }
+
+            // -------------------------------------------
+            // FEIL
+            //
+            // Feil vekker IKKE skjermen.
+            // Hvis skjermen allerede er på, hold den maks 15 min.
+            // -------------------------------------------
+
+            else if (s == "failure") {
+
+              if (id(display_backlight).state) {
+
+                id(attention_until) =
+                  now + 15UL * 60UL * 1000UL;
+              }
+            }
+
+        - script.execute: refresh_ui
+
+        - if:
+            condition:
+              lambda: |-
+                return id(status_event_pending);
+
+            then:
+              - script.execute: apply_display_policy
+
+
+  - platform: homeassistant
+    id: miele_program
+    entity_id: sensor.oppvaskmaskin_program
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+  - platform: homeassistant
+    id: miele_phase
+    entity_id: sensor.oppvaskmaskin_programfase
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+# =========================================================
+# HOME ASSISTANT - NUMERISKE VERDIER
+# =========================================================
+
+sensor:
+
+  - platform: homeassistant
+    id: miele_remaining
+    entity_id: sensor.oppvaskmaskin_gjenvaerende_tid
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+  - platform: homeassistant
+    id: miele_elapsed
+    entity_id: sensor.oppvaskmaskin_forlopt_tid
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+  - platform: homeassistant
+    id: miele_powerdisk
+    entity_id: sensor.oppvaskmaskin_powerdisk_niva
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+  - platform: homeassistant
+    id: miele_rinseaid
+    entity_id: sensor.oppvaskmaskin_skyllemiddelniva
+
+    on_value:
+      then:
+        - script.execute: refresh_ui
+
+
+# =========================================================
+# HOME ASSISTANT - BINÆRE VERDIER
+# =========================================================
+
+binary_sensor:
+
+  - platform: homeassistant
+    id: miele_door
+    entity_id: binary_sensor.oppvaskmaskin_dor
+
+    on_state:
+      then:
+        # Åpen dør vekker ikke skjermen.
+        - script.execute: refresh_ui
+
+
+  - platform: homeassistant
+    id: miele_problem
+    entity_id: binary_sensor.oppvaskmaskin_problem
+
+    on_state:
+      then:
+
+        - lambda: |-
+            const uint32_t now = millis();
+
+            if (id(miele_problem).state) {
+
+              // Bare behold en allerede tent skjerm.
+              if (id(display_backlight).state) {
+
+                id(attention_until) =
+                  now + 15UL * 60UL * 1000UL;
+              }
+
+            } else {
+
+              if (
+                !id(miele_warning).state &&
+                id(miele_status).state != "failure"
+              ) {
+                id(attention_until) = 0;
+              }
+            }
+
+        - script.execute: refresh_ui
+        - script.execute: apply_display_policy
+
+
+  - platform: homeassistant
+    id: miele_warning
+    entity_id: binary_sensor.oppvaskmaskin_varsel_aktivt
+
+    on_state:
+      then:
+
+        - lambda: |-
+            const uint32_t now = millis();
+
+            if (id(miele_warning).state) {
+
+              // Varsel vekker heller ikke skjermen.
+              if (id(display_backlight).state) {
+
+                id(attention_until) =
+                  now + 15UL * 60UL * 1000UL;
+              }
+
+            } else {
+
+              if (
+                !id(miele_problem).state &&
+                id(miele_status).state != "failure"
+              ) {
+                id(attention_until) = 0;
+              }
+            }
+
+        - script.execute: refresh_ui
+        - script.execute: apply_display_policy
+
+
+# =========================================================
+# LVGL
+# =========================================================
+
+lvgl:
+  displays:
+    - lcd
+
+  pages:
+
+    - id: main_page
+      width: 100%
+      height: 100%
+      bg_color: 0x07090D
+      bg_opa: COVER
+      scrollable: false
+
+      widgets:
+
+        # =================================================
+        # VENSTRE HOVEDKORT - TID / STATUS / PROGRAM
+        # =================================================
+
+        - obj:
+            id: main_card
+            x: 20
+            y: 14
+            width: 650
+            height: 440
+            radius: 26
+            bg_color: 0x10141C
+            bg_opa: COVER
+            border_color: 0x202735
+            border_width: 1
+            pad_all: 0
+            clickable: false
+
+            widgets:
+
+              # -------------------------------------------
+              # GJENVÆRENDE TID
+              # -------------------------------------------
+
+              - label:
+                  id: remaining_time_label
+                  x: 0
+                  y: 22
+                  width: 650
+                  height: 230
+                  text_align: CENTER
+                  text: "--:--"
+                  text_font: time_font
+                  text_color: 0xFFFFFF
+
+
+              # -------------------------------------------
+              # AV / KLAR / FERDIG / FEIL
+              # -------------------------------------------
+
+              - label:
+                  id: big_state_label
+                  x: 0
+                  y: 48
+                  width: 650
+                  height: 195
+                  text_align: CENTER
+                  text: "AV"
+                  text_font: state_font
+                  text_color: 0xFFFFFF
+                  hidden: true
+
+
+              # -------------------------------------------
+              # AKTIVITETSSPINNER
+              # -------------------------------------------
+
+              - spinner:
+                  id: running_spinner
+                  x: 112
+                  y: 270
+                  width: 42
+                  height: 42
+                  spin_time: 1200ms
+                  arc_length: 80deg
+                  arc_width: 5
+                  arc_color: 0x263142
+                  arc_rounded: true
+                  hidden: true
+
+                  indicator:
+                    arc_color: 0x2F9BFF
+                    arc_width: 5
+                    arc_rounded: true
+
+
+              # -------------------------------------------
+              # PROGRAMFASE
+              # -------------------------------------------
+
+              - label:
+                  id: phase_label
+                  x: 168
+                  y: 268
+                  width: 400
+                  height: 46
+                  text_align: LEFT
+                  text: ""
+                  text_font: body_font
+                  text_color: 0x2F9BFF
+
+
+              # -------------------------------------------
+              # VALGT PROGRAM
+              # -------------------------------------------
+
+              - label:
+                  id: program_label
+                  x: 25
+                  y: 360
+                  width: 600
+                  height: 60
+                  text_align: CENTER
+                  long_mode: DOT
+                  text: "OPPVASKMASKIN"
+                  text_font: title_font
+                  text_color: 0xF5F7FA
+
+
+        # =================================================
+        # HØYRE NIVÅKORT
+        # =================================================
+
+        - obj:
+            id: levels_card
+            x: 690
+            y: 14
+            width: 314
+            height: 440
+            radius: 26
+            bg_color: 0x10141C
+            bg_opa: COVER
+            border_color: 0x202735
+            border_width: 1
+            pad_all: 0
+            clickable: false
+
+            widgets:
+
+              - label:
+                  x: 0
+                  y: 18
+                  width: 314
+                  text_align: CENTER
+                  text: "NIVÅER"
+                  text_font: body_font
+                  text_color: 0xF5F7FA
+
+
+              # -------------------------------------------
+              # POWERSDISK
+              # -------------------------------------------
+
+              - label:
+                  x: 24
+                  y: 74
+                  text: "PowerDisk"
+                  text_font: small_font
+                  text_color: 0xC8CFDA
+
+              - label:
+                  id: powerdisk_value
+                  x: 190
+                  y: 74
+                  width: 98
+                  text_align: RIGHT
+                  text: "-- %"
+                  text_font: small_font
+                  text_color: 0xFFFFFF
+
+              - bar:
+                  id: powerdisk_bar
+                  x: 24
+                  y: 114
+                  width: 266
+                  height: 22
+                  min_value: 0
+                  max_value: 100
+                  value: 0
+                  animated: true
+                  anim_time: 600ms
+                  radius: 11
+                  bg_color: 0x252C38
+                  bg_opa: COVER
+
+                  indicator:
+                    bg_color: 0x30D158
+                    bg_opa: COVER
+                    radius: 11
+
+
+              # -------------------------------------------
+              # GLANSEMIDDEL
+              # -------------------------------------------
+
+              - label:
+                  x: 24
+                  y: 181
+                  text: "Glansemiddel"
+                  text_font: small_font
+                  text_color: 0xC8CFDA
+
+              - label:
+                  id: rinseaid_value
+                  x: 190
+                  y: 181
+                  width: 98
+                  text_align: RIGHT
+                  text: "-- %"
+                  text_font: small_font
+                  text_color: 0xFFFFFF
+
+              - bar:
+                  id: rinseaid_bar
+                  x: 24
+                  y: 221
+                  width: 266
+                  height: 22
+                  min_value: 0
+                  max_value: 100
+                  value: 0
+                  animated: true
+                  anim_time: 600ms
+                  radius: 11
+                  bg_color: 0x252C38
+                  bg_opa: COVER
+
+                  indicator:
+                    bg_color: 0x30D158
+                    bg_opa: COVER
+                    radius: 11
+
+
+              # -------------------------------------------
+              # HOME ASSISTANT
+              # -------------------------------------------
+
+              - label:
+                  x: 0
+                  y: 300
+                  width: 314
+                  text_align: CENTER
+                  text: "HOME ASSISTANT"
+                  text_font: tiny_font
+                  text_color: 0x596273
+
+              - obj:
+                  id: ha_pill
+                  x: 72
+                  y: 338
+                  width: 170
+                  height: 50
+                  radius: 25
+                  bg_color: 0x8A1F1F
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+
+                  widgets:
+
+                    - label:
+                        id: ha_label
+                        align: CENTER
+                        text: "HA --"
+                        text_font: small_font
+                        text_color: 0xFFFFFF
+
+
+        # =================================================
+        # VARSELBANNER
+        # =================================================
+
+        - obj:
+            id: alert_banner
+            x: 20
+            y: 468
+            width: 984
+            height: 48
+            radius: 18
+            bg_color: 0xA51B1B
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            hidden: true
+            clickable: false
+
+            widgets:
+
+              - label:
+                  id: alert_label
+                  align: CENTER
+                  text: "VARSEL"
+                  text_font: small_font
+                  text_color: 0xFFFFFF
+
+
+        # =================================================
+        # FREMDRIFTSTEKST
+        # =================================================
+
+        - label:
+            id: progress_label
+            x: 20
+            y: 530
+            width: 984
+            height: 34
+            text_align: CENTER
+            text: ""
+            text_font: small_font
+            text_color: 0x8993A4
+
+
+        # =================================================
+        # FULLBREDDE FREMDRIFTSBAR
+        # =================================================
+
+        - bar:
+            id: progress_bar
+            x: 0
+            y: 574
+            width: 1024
+            height: 26
+            min_value: 0
+            max_value: 100
+            value: 0
+            animated: true
+            anim_time: 800ms
+            radius: 0
+            bg_color: 0x202632
+            bg_opa: COVER
+
+            indicator:
+              bg_color: 0x2F9BFF
+              bg_opa: COVER
+              radius: 0
+
+
+# =========================================================
+# SCRIPTS
+# =========================================================
+
+script:
+
+  # =======================================================
+  # DISPLAY AV
+  # =======================================================
+
+  - id: screen_off
+    mode: restart
+
+    then:
+
+      - if:
+          condition:
+            switch.is_on: display_backlight
+
+          then:
+
+            - lvgl.pause:
+                show_snow: true
+
+            - delay: 100ms
+
+            - switch.turn_off: display_backlight
+
+            - lambda: |-
+                if (!id(ha_was_connected)) {
+                  id(ha_offline_active_since) = 0;
+                }
+
+
+  # =======================================================
+  # DISPLAY PÅ
+  # =======================================================
+
+  - id: screen_on
+    mode: restart
+
+    then:
+
+      - if:
+          condition:
+            switch.is_off: display_backlight
+
+          then:
+            - lvgl.resume:
+
+            - script.execute: refresh_ui
+
+            - lvgl.widget.redraw:
+
+            - delay: 100ms
+
+            - switch.turn_on: display_backlight
+
+
+  # =======================================================
+  # HOME ASSISTANT-FORBINDELSE
+  # =======================================================
+
+  - id: refresh_connection
+    mode: restart
+
+    then:
+
+      - if:
+          condition:
+            api.connected:
+              state_subscription_only: true
+
+          then:
+
+            - if:
+                condition:
+                  lambda: |-
+                    return !id(ha_was_connected);
+
+                then:
+
+                  - lambda: |-
+                      const bool first_connection =
+                        !id(ha_ever_connected);
+
+                      id(ha_was_connected) = true;
+                      id(ha_ever_connected) = true;
+                      id(ha_offline_active_since) = 0;
+
+                      // HA-reconnect skal ikke vekke en skjerm
+                      // som allerede var av.
+                      if (
+                        !first_connection &&
+                        !id(display_backlight).state
+                      ) {
+                        id(reconnect_hold_off) = true;
+                      }
+
+            - lvgl.label.update:
+                id: ha_label
+                text: "HA OK"
+                text_color: 0xFFFFFF
+
+            - lvgl.widget.update:
+                id: ha_pill
+                bg_color: 0x207A3C
+
+
+          else:
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(ha_was_connected);
+
+                then:
+
+                  - lambda: |-
+                      id(ha_was_connected) = false;
+
+                      if (id(display_backlight).state) {
+                        id(ha_offline_active_since) =
+                          millis();
+                      } else {
+                        id(ha_offline_active_since) = 0;
+                      }
+
+            - lvgl.label.update:
+                id: ha_label
+                text: "HA --"
+                text_color: 0xFFFFFF
+
+            - lvgl.widget.update:
+                id: ha_pill
+                bg_color: 0x8A1F1F
+
+
+  # =======================================================
+  # AUTOMATISK DISPLAYPOLICY
+  # =======================================================
+
+  - id: apply_display_policy
+    mode: restart
+
+    then:
+
+      - if:
+          condition:
+            api.connected:
+              state_subscription_only: true
+
+          # =================================================
+          # HA TILKOBLET
+          # =================================================
+
+          then:
+
+            - lambda: |-
+                const uint32_t now = millis();
+                const std::string s =
+                  id(miele_status).state;
+
+                // Utløpt manuell wake.
+                if (
+                  id(manual_wake_until) != 0 &&
+                  (int32_t)(
+                    id(manual_wake_until) - now
+                  ) <= 0
+                ) {
+                  id(manual_wake_until) = 0;
+                }
+
+                const bool manual_wake =
+                  id(manual_wake_until) != 0 &&
+                  (int32_t)(
+                    id(manual_wake_until) - now
+                  ) > 0;
+
+                const bool finished_active =
+                  id(finished_until) != 0 &&
+                  (int32_t)(
+                    id(finished_until) - now
+                  ) > 0;
+
+                const bool idle_active =
+                  id(idle_show_until) != 0 &&
+                  (int32_t)(
+                    id(idle_show_until) - now
+                  ) > 0;
+
+                const bool attention_active =
+                  id(attention_until) != 0 &&
+                  (int32_t)(
+                    id(attention_until) - now
+                  ) > 0;
+
+                const bool machine_active =
+                  s == "in_use" ||
+                  s == "pause" ||
+                  s == "programmed" ||
+                  s == "waiting_to_start";
+
+                bool want = false;
+
+                // Manuell AV.
+                if (id(manual_display_off)) {
+
+                  want = false;
+                }
+
+                // HA reconnect skal ikke alene vekke.
+                else if (id(reconnect_hold_off)) {
+
+                  want = false;
+                }
+
+                // Manuell touch-wake.
+                else if (manual_wake) {
+
+                  want = true;
+                }
+
+                // Aktiv oppvask.
+                else if (machine_active) {
+
+                  want = true;
+                }
+
+                // Nylig ferdig.
+                else if (finished_active) {
+
+                  want = true;
+                }
+
+                // Feil/varsel oppstått mens skjermen allerede var på.
+                else if (attention_active) {
+
+                  want = true;
+                }
+
+                // Kort AV/KLAR-visning.
+                else if (idle_active) {
+
+                  want = true;
+                }
+
+                id(want_screen_on) = want;
+
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(want_screen_on);
+
+                then:
+                  - script.execute: screen_on
+
+                else:
+                  - script.execute: screen_off
+
+
+          # =================================================
+          # HA NEDE
+          # =================================================
+
+          else:
+
+            - lambda: |-
+                const uint32_t now = millis();
+
+                bool want = false;
+
+                // En skjerm som allerede var på når HA forsvant,
+                // får være på i maksimalt 15 minutter.
+                if (id(display_backlight).state) {
+
+                  if (id(ha_offline_active_since) == 0) {
+
+                    id(ha_offline_active_since) = now;
+                  }
+
+                  want =
+                    (uint32_t)(
+                      now - id(ha_offline_active_since)
+                    )
+                    < 15UL * 60UL * 1000UL;
+                }
+
+                // En skjerm som allerede var av skal ikke vekkes
+                // fordi HA er nede.
+                else {
+
+                  want = false;
+                }
+
+                id(want_screen_on) = want;
+
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(want_screen_on);
+
+                then:
+                  - script.execute: screen_on
+
+                else:
+                  - script.execute: screen_off
+
+
+  # =======================================================
+  # UI-OPPDATERING
+  # =======================================================
+
+  - id: refresh_ui
+    mode: restart
+
+    then:
+
+      # ---------------------------------------------------
+      # PROGRAMNAVN
+      # ---------------------------------------------------
+
+      - lvgl.label.update:
+          id: program_label
+
+          text: !lambda |-
+            const std::string p =
+              id(miele_program).state;
+
+            if (
+              p.empty() ||
+              p == "unknown" ||
+              p == "unavailable" ||
+              p == "no_program"
+            ) {
+              return std::string("OPPVASKMASKIN");
+            }
+
+            if (p == "automatic")
+              return std::string("AUTOMATISK");
+
+            if (p == "comfort_wash")
+              return std::string("COMFORTWASH");
+
+            if (p == "comfort_wash_plus")
+              return std::string("COMFORTWASH+");
+
+            if (p == "eco")
+              return std::string("ECO");
+
+            if (p == "extra_quiet")
+              return std::string("EKSTRA STILLE");
+
+            if (p == "gentle")
+              return std::string("SKÅNSOM");
+
+            if (p == "glasses_warm")
+              return std::string("GLASS VARM");
+
+            if (p == "hygiene")
+              return std::string("HYGIENE");
+
+            if (p == "intensive")
+              return std::string("INTENSIV");
+
+            if (p == "maintenance")
+              return std::string("MASKINRENS");
+
+            if (p == "normal")
+              return std::string("NORMAL");
+
+            if (p == "pasta_paela")
+              return std::string("PASTA / PAELLA");
+
+            if (p == "pot_rests_and_filters")
+              return std::string("GRYTERISTER / FILTER");
+
+            if (p == "power_wash")
+              return std::string("POWERWASH");
+
+            if (p == "pre_wash")
+              return std::string("FORVASK");
+
+            if (p == "quick_intense")
+              return std::string("QUICK INTENSE");
+
+            if (p == "quick_power_wash")
+              return std::string("QUICKPOWERWASH");
+
+            if (p == "rinse_and_hold")
+              return std::string("SKYLL / HOLD");
+
+            if (p == "rinse_salt")
+              return std::string("SALT-SKYLLING");
+
+            if (p == "solar_save")
+              return std::string("SOLARSAVE");
+
+            if (p == "tall_items")
+              return std::string("HØYE GJENSTANDER");
+
+            return p;
+
+
+      # ---------------------------------------------------
+      # HOVEDFELT:
+      # TID / AV / KLAR / FERDIG / FEIL
+      # ---------------------------------------------------
+
+      - if:
+          condition:
+            lambda: |-
+              const uint32_t now = millis();
+
+              const std::string s =
+                id(miele_status).state;
+
+              const bool recently_finished =
+                id(finished_until) != 0 &&
+                (int32_t)(
+                  id(finished_until) - now
+                ) > 0;
+
+              return
+                s == "off" ||
+                s == "idle" ||
+                s == "on" ||
+                s == "program_ended" ||
+                s == "failure" ||
+                recently_finished;
+
+
+          # -----------------------------------------------
+          # STOR STATUS
+          # -----------------------------------------------
+
+          then:
+
+            - lvgl.widget.hide: remaining_time_label
+            - lvgl.widget.show: big_state_label
+
+            - lvgl.label.update:
+                id: big_state_label
+
+                text: !lambda |-
+                  const uint32_t now = millis();
+
+                  const std::string s =
+                    id(miele_status).state;
+
+                  const bool recently_finished =
+                    id(finished_until) != 0 &&
+                    (int32_t)(
+                      id(finished_until) - now
+                    ) > 0;
+
+                  if (
+                    s == "program_ended" ||
+                    recently_finished
+                  ) {
+                    return std::string("FERDIG");
+                  }
+
+                  if (s == "failure") {
+
+                    return std::string("FEIL");
+                  }
+
+                  if (s == "off") {
+
+                    return std::string("AV");
+                  }
+
+                  if (
+                    s == "idle" ||
+                    s == "on"
+                  ) {
+                    return std::string("KLAR");
+                  }
+
+                  return std::string("--");
+
+
+          # -----------------------------------------------
+          # RESTTID
+          # -----------------------------------------------
+
+          else:
+
+            - lvgl.widget.hide: big_state_label
+            - lvgl.widget.show: remaining_time_label
+
+            - lvgl.label.update:
+                id: remaining_time_label
+
+                text: !lambda |-
+                  const float x =
+                    id(miele_remaining).state;
+
+                  if (
+                    std::isnan(x) ||
+                    x < 0 ||
+                    x > 1440
+                  ) {
+                    return std::string("--:--");
+                  }
+
+                  const int mins =
+                    (int) std::round(x);
+
+                  char buf[16];
+
+                  snprintf(
+                    buf,
+                    sizeof(buf),
+                    "%d:%02d",
+                    mins / 60,
+                    mins % 60
+                  );
+
+                  return std::string(buf);
+
+
+      # ---------------------------------------------------
+      # PROGRAMFASE
+      # ---------------------------------------------------
+
+      - lvgl.label.update:
+          id: phase_label
+
+          text: !lambda |-
+            const std::string p =
+              id(miele_phase).state;
+
+            if (
+              p.empty() ||
+              p == "unknown" ||
+              p == "unavailable" ||
+              p == "not_running"
+            ) {
+              return std::string("");
+            }
+
+            if (p == "pre_dishwash")
+              return std::string("FORVASK");
+
+            if (p == "main_dishwash")
+              return std::string("HOVEDVASK");
+
+            if (p == "interim_rinse")
+              return std::string("MELLOMSKYLLING");
+
+            if (p == "final_rinse")
+              return std::string("SLUTTSKYLLING");
+
+            if (p == "drying")
+              return std::string("TØRKING");
+
+            if (p == "finished")
+              return std::string("FERDIG");
+
+            if (p == "reactivating")
+              return std::string("REGENERERING");
+
+            if (p == "rinse")
+              return std::string("SKYLLING");
+
+            return p;
+
+
+      # ---------------------------------------------------
+      # SPINNER
+      # ---------------------------------------------------
+
+      - if:
+          condition:
+            lambda: |-
+              return
+                id(miele_status).state == "in_use";
+
+          then:
+            - lvgl.widget.show: running_spinner
+
+          else:
+            - lvgl.widget.hide: running_spinner
+
+
+      # ---------------------------------------------------
+      # FASE- OG FREMDRIFTSFARGE
+      # ---------------------------------------------------
+
+      - if:
+          condition:
+            lambda: |-
+              return
+                id(miele_phase).state == "drying";
+
+          then:
+
+            - lvgl.label.update:
+                id: phase_label
+                text_color: 0xFF9F0A
+
+            - lvgl.bar.update:
+                id: progress_bar
+                indicator:
+                  bg_color: 0xFF9F0A
+
+
+          else:
+
+            - if:
+                condition:
+                  lambda: |-
+                    const std::string p =
+                      id(miele_phase).state;
+
+                    return p == "finished";
+
+                then:
+
+                  - lvgl.label.update:
+                      id: phase_label
+                      text_color: 0x30D158
+
+                  - lvgl.bar.update:
+                      id: progress_bar
+                      indicator:
+                        bg_color: 0x30D158
+
+
+                else:
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          const std::string p =
+                            id(miele_phase).state;
+
+                          return
+                            p == "interim_rinse" ||
+                            p == "final_rinse" ||
+                            p == "rinse";
+
+                      then:
+
+                        - lvgl.label.update:
+                            id: phase_label
+                            text_color: 0x00C7BE
+
+                        - lvgl.bar.update:
+                            id: progress_bar
+                            indicator:
+                              bg_color: 0x00C7BE
+
+
+                      else:
+
+                        - lvgl.label.update:
+                            id: phase_label
+                            text_color: 0x2F9BFF
+
+                        - lvgl.bar.update:
+                            id: progress_bar
+                            indicator:
+                              bg_color: 0x2F9BFF
+
+
+      # ---------------------------------------------------
+      # FREMDRIFT
+      # ---------------------------------------------------
+
+      - lvgl.bar.update:
+          id: progress_bar
+
+          value: !lambda |-
+            const uint32_t now = millis();
+
+            const std::string s =
+              id(miele_status).state;
+
+            const bool recently_finished =
+              id(finished_until) != 0 &&
+              (int32_t)(
+                id(finished_until) - now
+              ) > 0;
+
+            if (
+              s == "program_ended" ||
+              recently_finished
+            ) {
+              return 100;
+            }
+
+            const float elapsed =
+              id(miele_elapsed).state;
+
+            const float remaining =
+              id(miele_remaining).state;
+
+            if (
+              std::isnan(elapsed) ||
+              std::isnan(remaining) ||
+              elapsed < 0 ||
+              remaining < 0
+            ) {
+              return 0;
+            }
+
+            const float total =
+              elapsed + remaining;
+
+            if (total <= 0) {
+
+              return 0;
+            }
+
+            int pct =
+              (int) std::round(
+                (elapsed / total) * 100.0f
+              );
+
+            if (pct < 0)
+              pct = 0;
+
+            if (pct > 100)
+              pct = 100;
+
+            return pct;
+
+          animated: true
+
+
+      - lvgl.label.update:
+          id: progress_label
+
+          text: !lambda |-
+            const uint32_t now = millis();
+
+            const std::string s =
+              id(miele_status).state;
+
+            const bool recently_finished =
+              id(finished_until) != 0 &&
+              (int32_t)(
+                id(finished_until) - now
+              ) > 0;
+
+            if (
+              s == "program_ended" ||
+              recently_finished
+            ) {
+              return std::string(
+                "100 %  |  FERDIG"
+              );
+            }
+
+            const float elapsed =
+              id(miele_elapsed).state;
+
+            const float remaining =
+              id(miele_remaining).state;
+
+            if (
+              std::isnan(elapsed) ||
+              std::isnan(remaining) ||
+              elapsed < 0 ||
+              remaining < 0
+            ) {
+              return std::string("");
+            }
+
+            const float total =
+              elapsed + remaining;
+
+            if (total <= 0) {
+
+              return std::string("");
+            }
+
+            int pct =
+              (int) std::round(
+                (elapsed / total) * 100.0f
+              );
+
+            if (pct < 0)
+              pct = 0;
+
+            if (pct > 100)
+              pct = 100;
+
+            const int e =
+              (int) std::round(elapsed);
+
+            char buf[80];
+
+            snprintf(
+              buf,
+              sizeof(buf),
+              "%d %%  |  %d:%02d brukt",
+              pct,
+              e / 60,
+              e % 60
+            );
+
+            return std::string(buf);
+
+
+      # ---------------------------------------------------
+      # POWERSDISK VERDI
+      # ---------------------------------------------------
+
+      - lvgl.label.update:
+          id: powerdisk_value
+
+          text: !lambda |-
+            const float x =
+              id(miele_powerdisk).state;
+
+            if (std::isnan(x)) {
+
+              return std::string("-- %");
+            }
+
+            char buf[16];
+
+            snprintf(
+              buf,
+              sizeof(buf),
+              "%.0f %%",
+              x
+            );
+
+            return std::string(buf);
+
+
+      - lvgl.bar.update:
+          id: powerdisk_bar
+
+          value: !lambda |-
+            const float x =
+              id(miele_powerdisk).state;
+
+            if (std::isnan(x))
+              return 0;
+
+            if (x <= 0)
+              return 0;
+
+            if (x >= 100)
+              return 100;
+
+            return
+              (int) std::round(x);
+
+          animated: true
+
+
+      # POWERSDISK FARGE
+
+      - if:
+          condition:
+            lambda: |-
+              return
+                std::isnan(
+                  id(miele_powerdisk).state
+                );
+
+          then:
+
+            - lvgl.bar.update:
+                id: powerdisk_bar
+                indicator:
+                  bg_color: 0x596273
+
+
+          else:
+
+            - if:
+                condition:
+                  lambda: |-
+                    return
+                      id(miele_powerdisk).state < 15;
+
+                then:
+
+                  - lvgl.bar.update:
+                      id: powerdisk_bar
+                      indicator:
+                        bg_color: 0xFF453A
+
+
+                else:
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return
+                            id(miele_powerdisk).state < 30;
+
+                      then:
+
+                        - lvgl.bar.update:
+                            id: powerdisk_bar
+                            indicator:
+                              bg_color: 0xFFD60A
+
+
+                      else:
+
+                        - lvgl.bar.update:
+                            id: powerdisk_bar
+                            indicator:
+                              bg_color: 0x30D158
+
+
+      # ---------------------------------------------------
+      # GLANSEMIDDEL
+      # ---------------------------------------------------
+
+      - lvgl.label.update:
+          id: rinseaid_value
+
+          text: !lambda |-
+            const float x =
+              id(miele_rinseaid).state;
+
+            if (std::isnan(x)) {
+
+              return std::string("-- %");
+            }
+
+            char buf[16];
+
+            snprintf(
+              buf,
+              sizeof(buf),
+              "%.0f %%",
+              x
+            );
+
+            return std::string(buf);
+
+
+      - lvgl.bar.update:
+          id: rinseaid_bar
+
+          value: !lambda |-
+            const float x =
+              id(miele_rinseaid).state;
+
+            if (std::isnan(x))
+              return 0;
+
+            if (x <= 0)
+              return 0;
+
+            if (x >= 100)
+              return 100;
+
+            return
+              (int) std::round(x);
+
+          animated: true
+
+
+      # GLANSEMIDDEL FARGE
+
+      - if:
+          condition:
+            lambda: |-
+              return
+                std::isnan(
+                  id(miele_rinseaid).state
+                );
+
+          then:
+
+            - lvgl.bar.update:
+                id: rinseaid_bar
+                indicator:
+                  bg_color: 0x596273
+
+
+          else:
+
+            - if:
+                condition:
+                  lambda: |-
+                    return
+                      id(miele_rinseaid).state < 15;
+
+                then:
+
+                  - lvgl.bar.update:
+                      id: rinseaid_bar
+                      indicator:
+                        bg_color: 0xFF453A
+
+
+                else:
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return
+                            id(miele_rinseaid).state < 30;
+
+                      then:
+
+                        - lvgl.bar.update:
+                            id: rinseaid_bar
+                            indicator:
+                              bg_color: 0xFFD60A
+
+
+                      else:
+
+                        - lvgl.bar.update:
+                            id: rinseaid_bar
+                            indicator:
+                              bg_color: 0x30D158
+
+
+      # ---------------------------------------------------
+      # FEIL / VARSEL / DØR
+      #
+      # PRIORITET:
+      # FEIL > VARSEL > DØR
+      #
+      # Ingen av disse vekker displayet.
+      # ---------------------------------------------------
+
+      - if:
+          condition:
+            lambda: |-
+              return
+                id(miele_problem).state ||
+                id(miele_status).state == "failure";
+
+          then:
+
+            - lvgl.label.update:
+                id: alert_label
+                text: "FEIL PÅ OPPVASKMASKIN"
+            - lvgl.widget.update:
+                id: alert_banner
+                bg_color: 0xA51B1B
+
+            - lvgl.widget.show: alert_banner
+
+
+          else:
+
+            - if:
+                condition:
+                  binary_sensor.is_on: miele_warning
+
+                then:
+
+                  - lvgl.label.update:
+                      id: alert_label
+                      text: "VARSEL FRA OPPVASKMASKIN"
+
+                  - lvgl.widget.update:
+                      id: alert_banner
+                      bg_color: 0x9A5700
+
+                  - lvgl.widget.show: alert_banner
+
+
+                else:
+
+                  - if:
+                      condition:
+                        binary_sensor.is_on: miele_door
+
+                      then:
+
+                        - lvgl.label.update:
+                            id: alert_label
+                            text: "DØR ÅPEN"
+
+                        - lvgl.widget.update:
+                            id: alert_banner
+                            bg_color: 0x805600
+
+                        - lvgl.widget.show: alert_banner
+
+
+                      else:
+
+                        - lvgl.widget.hide: alert_banner
+
+
+# =========================================================
+# PERIODISKE OPPDATERINGER
+# =========================================================
+
+interval:
+
+  # Først forbindelsesstatus, deretter skjermpolicy.
+  # Viktig ved HA-restart/reconnect.
+
+  - interval: 2s
+    then:
+      - script.execute: refresh_connection
+      - script.execute: apply_display_policy
+
+
+  # Periodisk grafisk sikkerhetsoppdatering.
+
+  - interval: 30s
+    then:
+      - script.execute: refresh_ui

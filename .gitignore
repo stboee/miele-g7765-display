@@ -1,0 +1,12 @@
+# ESPHome local secrets
+secrets.yaml
+**/secrets.yaml
+
+# ESPHome build/runtime files
+.esphome/
+**/.esphome/
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
